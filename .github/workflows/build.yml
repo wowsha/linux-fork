@@ -1,28 +1,38 @@
-name: Build Maxed-Out Linux Kernel ISO
+name: Build Maxed-Out Linux Kernel ISO (on /tmp RAM disk)
 
 on:
-  workflow_dispatch:          # run manually
+  workflow_dispatch:
   push:
-    branches: [ main ]       # or any branch you push to
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write         # needed for creating a release
+      contents: write
 
     steps:
       # -------------------------------------------------
-      # 1. Checkout your fork
+      # 1. Mount /tmp as tmpfs (4 GB RAM disk)
+      # -------------------------------------------------
+      - name: Mount /tmp as tmpfs (4 GB)
+        run: |
+          sudo mkdir -p /tmp
+          sudo mount -t tmpfs -o size=4G tmpfs /tmp
+          echo "tmpfs mounted: $(df -h /tmp | tail -1)"
+
+      # -------------------------------------------------
+      # 2. Checkout kernel source into /tmp
       # -------------------------------------------------
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}   # your fork
+          path: /tmp/linux-src
+          repository: ${{ github.repository }}
           ref: ${{ github.ref }}
 
       # -------------------------------------------------
-      # 2. Install build dependencies
+      # 3. Install build tools
       # -------------------------------------------------
       - name: Install build tools
         run: |
@@ -33,72 +43,81 @@ jobs:
             qemu-system-x86 cpio
 
       # -------------------------------------------------
-      # 3. Create a "max everything" .config
+      # 4. Enter source dir and generate maximal config
       # -------------------------------------------------
       - name: Generate maximal config
         run: |
-          # Start from the current defconfig (x86_64)
+          cd /tmp/linux-src
+
           make defconfig
 
-          # ---- Enable *everything* that can be built as a module ----
-          # Turn every possible option to =m (module) where possible
-          scripts/config --module CONFIG_*          || true
-          scripts/config --enable CONFIG_*          || true
-          scripts/config --set-val CONFIG_NR_CPUS 4096
-          scripts/config --set-val CONFIG_LOCALVERSION "-maxed"
+          # Enable EVERYTHING as module where possible
+          ./scripts/config --module CONFIG_*  || true
+          ./scripts/config --enable CONFIG_*   || true
 
-          # ---- Force a few things that are normally =n ----
-          # (debug, tracing, etc.)
-          scripts/config --enable CONFIG_DEBUG_INFO
-          scripts/config --enable CONFIG_KASAN
-          scripts/config --enable CONFIG_KCSAN
-          scripts/config --enable CONFIG_DEBUG_KERNEL
-          scripts/config --enable CONFIG_PROVE_LOCKING
-          scripts/config --enable CONFIG_FTRACE
-          scripts/config --enable CONFIG_KPROBES
+          # Force debug, tracing, etc.
+          ./scripts/config --enable CONFIG_DEBUG_INFO
+          ./scripts/config --enable CONFIG_KASAN
+          ./scripts/config --enable CONFIG_KCSAN
+          ./scripts/config --enable CONFIG_DEBUG_KERNEL
+          ./scripts/config --enable CONFIG_FTRACE
+          ./scripts/config --enable CONFIG_NR_CPUS 4096
+          ./scripts/config --set-str CONFIG_LOCALVERSION "-maxed"
 
-          # Save the final config
           cp .config .config-maxed
 
       # -------------------------------------------------
-      # 4. Build kernel + modules + initramfs
+      # 5. Build kernel + modules + initramfs (all in /tmp)
       # -------------------------------------------------
-      - name: Build kernel (parallel)
+      - name: Build kernel and modules
         run: |
+          cd /tmp/linux-src
+
           make -j$(nproc) bzImage
           make -j$(nproc) modules
 
-          # Install modules into a temporary tree
-          mkdir -p $HOME/kernel-modules
-          make INSTALL_MOD_PATH=$HOME/kernel-modules modules_install
+          # Install modules into /tmp
+          mkdir -p /tmp/kernel-modules
+          make INSTALL_MOD_PATH=/tmp/kernel-modules modules_install
 
-          # Build a tiny initramfs that contains *all* modules
-          mkdir -p initramfs/{bin,sbin,lib,lib/modules,dev,proc,sys,etc}
-          cp -a $HOME/kernel-modules/lib/modules/* initramfs/lib/modules/
-          # minimal busybox (static) for boot
-          wget -O busybox https://busybox.net/downloads/binaries/1.36.1/busybox-x86_64
-          chmod +x busybox
-          cp busybox initramfs/bin/
-          ln -s busybox initramfs/bin/sh
-          echo ":: /bin/sh" > initramfs/init
-          chmod +x initramfs/init
+          # Build initramfs with ALL modules
+          mkdir -p /tmp/initramfs/{bin,lib,lib/modules,dev,proc,sys}
+          cp -a /tmp/kernel-modules/lib/modules/* /tmp/initramfs/lib/modules/
 
-          # Create cpio initramfs
-          (cd initramfs && find . | cpio -o -H newc | gzip > ../initramfs.cpio.gz)
+          # Minimal busybox
+          wget -O /tmp/busybox https://busybox.net/downloads/binaries/1.36.1/busybox-x86_64
+          chmod +x /tmp/busybox
+          cp /tmp/busybox /tmp/initramfs/bin/
+          ln -s busybox /tmp/initramfs/bin/sh
+
+          # init script
+          cat > /tmp/initramfs/init <<'EOF'
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          echo "Maxed-out Linux booted!"
+          exec /bin/sh
+          EOF
+          chmod +x /tmp/initramfs/init
+
+          # Pack initramfs
+          (cd /tmp/initramfs && find . | cpio -o -H newc | gzip > /tmp/initramfs.cpio.gz)
 
       # -------------------------------------------------
-      # 5. Create bootable ISO
+      # 6. Create bootable ISO in /tmp
       # -------------------------------------------------
       - name: Create ISO
         run: |
+          cd /tmp/linux-src
           KERNEL_VER=$(make kernelrelease)
           ISO_NAME="linux-${KERNEL_VER}-maxed.iso"
+          ISO_PATH="/tmp/$ISO_NAME"
 
-          mkdir -p iso/boot/grub
-          cp arch/x86/boot/bzImage iso/boot/vmlinuz
-          cp initramfs.cpio.gz iso/boot/initrd.gz
+          mkdir -p /tmp/iso/boot/grub
+          cp arch/x86/boot/bzImage /tmp/iso/boot/vmlinuz
+          cp /tmp/initramfs.cpio.gz /tmp/iso/boot/initrd.gz
 
-          cat > iso/boot/grub/grub.cfg <<EOF
+          cat > /tmp/iso/boot/grub/grub.cfg <<EOF
           set timeout=3
           menuentry "Linux ${KERNEL_VER} (maxed)" {
               linux /boot/vmlinuz root=/dev/ram0 rdinit=/init
@@ -106,27 +125,38 @@ jobs:
           }
           EOF
 
-          grub-mkrescue -o "$ISO_NAME" iso
-          echo "ISO=$ISO_NAME" >> $GITHUB_ENV
+          grub-mkrescue -o "$ISO_PATH" /tmp/iso
+          echo "ISO created: $ISO_PATH ($(du -h $ISO_PATH | cut -f1))"
+          echo "ISO_PATH=$ISO_PATH" >> $GITHUB_ENV
+          echo "ISO_NAME=$ISO_NAME" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # 6. Upload ISO as artifact
+      # 7. Upload ISO as artifact
       # -------------------------------------------------
       - name: Upload ISO artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ISO }}
-          path: ${{ env.ISO }}
+          name: ${{ env.ISO_NAME }}
+          path: ${{ env.ISO_PATH }}
 
       # -------------------------------------------------
-      # 7. (Optional) Create a GitHub Release
+      # 8. (Optional) Create GitHub Release
       # -------------------------------------------------
       - name: Create Release
-        if: github.event_name == 'push' && github.ref == 'refs7/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.run_number }}
-          name: Maxed kernel ISO #${{ github.run_number }}
+          tag_name: iso-${{ github.run_number }}
+          name: Maxed Kernel ISO #${{ github.run_number }}
+          files: ${{ env.ISO_PATH }}
           draft: false
           prerelease: false
-          files: ${{ env.ISO }}
+
+      # -------------------------------------------------
+      # 9. Cleanup (unmount tmpfs)
+      # -------------------------------------------------
+      - name: Unmount tmpfs
+        if: always()
+        run: |
+          sudo umount /tmp || true
+          echo "/tmp tmpfs unmounted"

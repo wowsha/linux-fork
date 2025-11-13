@@ -1,0 +1,132 @@
+name: Build Maxed-Out Linux Kernel ISO
+
+on:
+  workflow_dispatch:          # run manually
+  push:
+    branches: [ main ]       # or any branch you push to
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # needed for creating a release
+
+    steps:
+      # -------------------------------------------------
+      # 1. Checkout your fork
+      # -------------------------------------------------
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}   # your fork
+          ref: ${{ github.ref }}
+
+      # -------------------------------------------------
+      # 2. Install build dependencies
+      # -------------------------------------------------
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libelf-dev libssl-dev \
+            libncurses5-dev git wget xorriso grub-pc-bin mtools \
+            qemu-system-x86 cpio
+
+      # -------------------------------------------------
+      # 3. Create a "max everything" .config
+      # -------------------------------------------------
+      - name: Generate maximal config
+        run: |
+          # Start from the current defconfig (x86_64)
+          make defconfig
+
+          # ---- Enable *everything* that can be built as a module ----
+          # Turn every possible option to =m (module) where possible
+          scripts/config --module CONFIG_*          || true
+          scripts/config --enable CONFIG_*          || true
+          scripts/config --set-val CONFIG_NR_CPUS 4096
+          scripts/config --set-val CONFIG_LOCALVERSION "-maxed"
+
+          # ---- Force a few things that are normally =n ----
+          # (debug, tracing, etc.)
+          scripts/config --enable CONFIG_DEBUG_INFO
+          scripts/config --enable CONFIG_KASAN
+          scripts/config --enable CONFIG_KCSAN
+          scripts/config --enable CONFIG_DEBUG_KERNEL
+          scripts/config --enable CONFIG_PROVE_LOCKING
+          scripts/config --enable CONFIG_FTRACE
+          scripts/config --enable CONFIG_KPROBES
+
+          # Save the final config
+          cp .config .config-maxed
+
+      # -------------------------------------------------
+      # 4. Build kernel + modules + initramfs
+      # -------------------------------------------------
+      - name: Build kernel (parallel)
+        run: |
+          make -j$(nproc) bzImage
+          make -j$(nproc) modules
+
+          # Install modules into a temporary tree
+          mkdir -p $HOME/kernel-modules
+          make INSTALL_MOD_PATH=$HOME/kernel-modules modules_install
+
+          # Build a tiny initramfs that contains *all* modules
+          mkdir -p initramfs/{bin,sbin,lib,lib/modules,dev,proc,sys,etc}
+          cp -a $HOME/kernel-modules/lib/modules/* initramfs/lib/modules/
+          # minimal busybox (static) for boot
+          wget -O busybox https://busybox.net/downloads/binaries/1.36.1/busybox-x86_64
+          chmod +x busybox
+          cp busybox initramfs/bin/
+          ln -s busybox initramfs/bin/sh
+          echo ":: /bin/sh" > initramfs/init
+          chmod +x initramfs/init
+
+          # Create cpio initramfs
+          (cd initramfs && find . | cpio -o -H newc | gzip > ../initramfs.cpio.gz)
+
+      # -------------------------------------------------
+      # 5. Create bootable ISO
+      # -------------------------------------------------
+      - name: Create ISO
+        run: |
+          KERNEL_VER=$(make kernelrelease)
+          ISO_NAME="linux-${KERNEL_VER}-maxed.iso"
+
+          mkdir -p iso/boot/grub
+          cp arch/x86/boot/bzImage iso/boot/vmlinuz
+          cp initramfs.cpio.gz iso/boot/initrd.gz
+
+          cat > iso/boot/grub/grub.cfg <<EOF
+          set timeout=3
+          menuentry "Linux ${KERNEL_VER} (maxed)" {
+              linux /boot/vmlinuz root=/dev/ram0 rdinit=/init
+              initrd /boot/initrd.gz
+          }
+          EOF
+
+          grub-mkrescue -o "$ISO_NAME" iso
+          echo "ISO=$ISO_NAME" >> $GITHUB_ENV
+
+      # -------------------------------------------------
+      # 6. Upload ISO as artifact
+      # -------------------------------------------------
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ISO }}
+          path: ${{ env.ISO }}
+
+      # -------------------------------------------------
+      # 7. (Optional) Create a GitHub Release
+      # -------------------------------------------------
+      - name: Create Release
+        if: github.event_name == 'push' && github.ref == 'refs7/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Maxed kernel ISO #${{ github.run_number }}
+          draft: false
+          prerelease: false
+          files: ${{ env.ISO }}

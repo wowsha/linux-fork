@@ -22,17 +22,25 @@ jobs:
           echo "tmpfs mounted: $(df -h /tmp | tail -1)"
 
       # -------------------------------------------------
-      # 2. Checkout kernel source into /tmp
+      # 2. Checkout kernel source (to DEFAULT workspace path)
       # -------------------------------------------------
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          path: /tmp/linux-src
           repository: ${{ github.repository }}
           ref: ${{ github.ref }}
+          # No 'path' = defaults to $GITHUB_WORKSPACE (e.g., /home/runner/work/linux-fork/linux-fork)
 
       # -------------------------------------------------
-      # 3. Install build tools
+      # 3. Symlink /tmp/linux-src → workspace (for compatibility)
+      # -------------------------------------------------
+      - name: Symlink source dir
+        run: |
+          ln -s "$GITHUB_WORKSPACE" /tmp/linux-src
+          echo "Symlinked /tmp/linux-src → $GITHUB_WORKSPACE"
+
+      # -------------------------------------------------
+      # 4. Install build tools
       # -------------------------------------------------
       - name: Install build tools
         run: |
@@ -43,11 +51,11 @@ jobs:
             qemu-system-x86 cpio
 
       # -------------------------------------------------
-      # 4. Enter source dir and generate maximal config
+      # 5. Generate maximal config (in workspace)
       # -------------------------------------------------
       - name: Generate maximal config
         run: |
-          cd /tmp/linux-src
+          cd "$GITHUB_WORKSPACE"   # or cd /tmp/linux-src (symlink works)
 
           make defconfig
 
@@ -61,26 +69,26 @@ jobs:
           ./scripts/config --enable CONFIG_KCSAN
           ./scripts/config --enable CONFIG_DEBUG_KERNEL
           ./scripts/config --enable CONFIG_FTRACE
-          ./scripts/config --enable CONFIG_NR_CPUS 4096
+          ./scripts/config --set-val CONFIG_NR_CPUS 4096
           ./scripts/config --set-str CONFIG_LOCALVERSION "-maxed"
 
           cp .config .config-maxed
 
       # -------------------------------------------------
-      # 5. Build kernel + modules + initramfs (all in /tmp)
+      # 6. Build kernel and modules (source in workspace, modules in /tmp)
       # -------------------------------------------------
       - name: Build kernel and modules
         run: |
-          cd /tmp/linux-src
+          cd "$GITHUB_WORKSPACE"
 
           make -j$(nproc) bzImage
           make -j$(nproc) modules
 
-          # Install modules into /tmp
+          # Install modules into /tmp (RAM disk for speed)
           mkdir -p /tmp/kernel-modules
           make INSTALL_MOD_PATH=/tmp/kernel-modules modules_install
 
-          # Build initramfs with ALL modules
+          # Build initramfs with ALL modules (in /tmp)
           mkdir -p /tmp/initramfs/{bin,lib,lib/modules,dev,proc,sys}
           cp -a /tmp/kernel-modules/lib/modules/* /tmp/initramfs/lib/modules/
 
@@ -104,11 +112,11 @@ jobs:
           (cd /tmp/initramfs && find . | cpio -o -H newc | gzip > /tmp/initramfs.cpio.gz)
 
       # -------------------------------------------------
-      # 6. Create bootable ISO in /tmp
+      # 7. Create bootable ISO in /tmp
       # -------------------------------------------------
       - name: Create ISO
         run: |
-          cd /tmp/linux-src
+          cd "$GITHUB_WORKSPACE"
           KERNEL_VER=$(make kernelrelease)
           ISO_NAME="linux-${KERNEL_VER}-maxed.iso"
           ISO_PATH="/tmp/$ISO_NAME"
@@ -131,7 +139,7 @@ jobs:
           echo "ISO_NAME=$ISO_NAME" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # 7. Upload ISO as artifact
+      # 8. Upload ISO as artifact
       # -------------------------------------------------
       - name: Upload ISO artifact
         uses: actions/upload-artifact@v4
@@ -140,7 +148,7 @@ jobs:
           path: ${{ env.ISO_PATH }}
 
       # -------------------------------------------------
-      # 8. (Optional) Create GitHub Release
+      # 9. (Optional) Create GitHub Release
       # -------------------------------------------------
       - name: Create Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -153,7 +161,7 @@ jobs:
           prerelease: false
 
       # -------------------------------------------------
-      # 9. Cleanup (unmount tmpfs)
+      # 10. Cleanup (unmount tmpfs)
       # -------------------------------------------------
       - name: Unmount tmpfs
         if: always()
